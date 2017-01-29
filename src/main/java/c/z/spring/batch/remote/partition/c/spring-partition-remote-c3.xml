@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bean:beans xmlns="http://www.springframework.org/schema/batch"
+	xmlns:bean="http://www.springframework.org/schema/beans" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xmlns:p="http://www.springframework.org/schema/p" xmlns:tx="http://www.springframework.org/schema/tx"
+	xmlns:aop="http://www.springframework.org/schema/aop" xmlns:context="http://www.springframework.org/schema/context"
+	xmlns:int="http://www.springframework.org/schema/integration"
+	xmlns:int-jms="http://www.springframework.org/schema/integration/jms"
+	xmlns:jms="http://www.springframework.org/schema/jms" xmlns:amq="http://activemq.apache.org/schema/core"
+	xsi:schemaLocation="http://www.springframework.org/schema/beans 
+    http://www.springframework.org/schema/beans/spring-beans-4.1.xsd  
+    http://www.springframework.org/schema/tx 
+    http://www.springframework.org/schema/tx/spring-tx-4.1.xsd  
+    http://www.springframework.org/schema/aop 
+    http://www.springframework.org/schema/aop/spring-aop-4.1.xsd  
+    http://www.springframework.org/schema/context 
+    http://www.springframework.org/schema/context/spring-context-4.1.xsd
+    http://www.springframework.org/schema/batch 
+    http://www.springframework.org/schema/batch/spring-batch-3.0.xsd
+    http://www.springframework.org/schema/integration 
+    http://www.springframework.org/schema/integration/spring-integration-4.1.xsd
+    http://www.springframework.org/schema/integration/jms 
+    http://www.springframework.org/schema/integration/jms/spring-integration-jms-4.1.xsd
+    http://www.springframework.org/schema/jms 
+    http://www.springframework.org/schema/jms/spring-jms-4.1.xsd
+    http://activemq.apache.org/schema/core 
+    http://activemq.apache.org/schema/core/activemq-core.xsd">
+
+	<bean:bean id="transactionManager"
+		class="org.springframework.batch.support.transaction.ResourcelessTransactionManager" />
+
+	<bean:bean id="jobRepository"
+		class="org.springframework.batch.core.repository.support.MapJobRepositoryFactoryBean">
+	</bean:bean>
+
+	<bean:bean id="jobLauncher"
+		class="org.springframework.batch.core.launch.support.SimpleJobLauncher">
+		<bean:property name="jobRepository" ref="jobRepository" />
+	</bean:bean>
+
+
+	<job id="partitionRemoteJob">
+		<step id="partitionRemoteStep">
+			<partition partitioner="partitioner" handler="partitionHandler" />
+		</step>
+	</job>
+
+	<bean:bean id="partitioner"
+		class="c.z.spring.batch.remote.partition.p.MyPartitioner">
+	</bean:bean>
+
+	<bean:bean id="partitionHandler"
+		class="org.springframework.batch.integration.partition.MessageChannelPartitionHandler">
+		<bean:property name="messagingOperations">
+			<bean:bean class="org.springframework.integration.core.MessagingTemplate">
+				<bean:property name="defaultChannel" ref="requests" />
+				<bean:property name="receiveTimeout" value="30000" />
+			</bean:bean>
+		</bean:property>
+		<bean:property name="replyChannel" ref="replies" />
+		<bean:property name="stepName" value="remoteStep" />
+		<bean:property name="gridSize" value="2" />
+	</bean:bean>
+
+	<step id="remoteStep">
+		<tasklet>
+			<chunk reader="flatFileItemReader" writer="jdbcItemWriter"
+				commit-interval="10" />
+			<!-- <listeners> <listener ref="partitionItemReadListener"></listener> 
+				</listeners> -->
+		</tasklet>
+	</step>
+
+	<int-jms:outbound-channel-adapter
+		connection-factory="connectionFactory" channel="requests"
+		destination-name="requests-partition" />
+	<int:channel id="requests" />
+	<int:channel id="incoming" />
+	<int:transformer input-channel="incoming"
+		output-channel="replies" ref="headerExtractor" method="extract" />
+
+	<bean:bean id="headerExtractor"
+		class="c.z.spring.batch.remote.partition.p.MessageTransformer" />
+
+	<int:channel id="replies" scope="thread">
+		<int:queue />
+		<int:interceptors>
+			<bean:bean id="pollerInterceptor"
+				class="c.z.spring.batch.remote.partition.c.MessageSourcePollerInterceptor">
+				<bean:property name="messageSource">
+					<bean:bean
+						class="org.springframework.integration.jms.JmsDestinationPollingSource">
+						<bean:constructor-arg>
+							<bean:bean class="org.springframework.jms.core.JmsTemplate">
+								<bean:property name="connectionFactory" ref="connectionFactory" />
+								<bean:property name="defaultDestinationName"
+									value="replies-partition" />
+								<bean:property name="receiveTimeout" value="1000" />
+							</bean:bean>
+						</bean:constructor-arg>
+					</bean:bean>
+				</bean:property>
+				<bean:property name="channel" ref="incoming" />
+			</bean:bean>
+		</int:interceptors>
+	</int:channel>
+
+	<jms:listener-container connection-factory="connectionFactory"
+		transaction-manager="transactionManager" acknowledge="transacted"
+		concurrency="10" >
+		<jms:listener destination="requests"
+			response-destination="replies" ref="stepExecutionRequestHandler"
+			method="handle"  />
+	</jms:listener-container>
+
+	<bean:bean id="stepExecutionRequestHandler"
+		class="org.springframework.batch.integration.partition.StepExecutionRequestHandler">
+		<bean:property name="jobExplorer" ref="jobExplorer" />
+		<bean:property name="stepLocator" ref="stepLocator" />
+	</bean:bean>
+
+	<bean:bean id="stepLocator"
+		class="org.springframework.batch.integration.partition.BeanFactoryStepLocator" />
+
+	<bean:bean id="jobExplorer"
+		class="org.springframework.batch.core.explore.support.MapJobExplorerFactoryBean">
+		<!-- <bean:constructor-arg index="0" ref="jobRepository" /> -->
+		<bean:property name="repositoryFactory" ref="&amp;jobRepository" />
+	</bean:bean>
+
+	<!-- <amq:broker useJmx="false" persistent="false" schedulerSupport="false"> 
+		<amq:transportConnectors> <amq:transportConnector uri="tcp://localhost:61616" 
+		/> </amq:transportConnectors> </amq:broker> -->
+	<amq:connectionFactory id="connectionFactory"
+		brokerURL="tcp://localhost:61616" />
+
+	<bean:bean
+		class="org.springframework.beans.factory.config.CustomScopeConfigurer">
+		<bean:property name="scopes">
+			<bean:map>
+				<bean:entry key="thread">
+					<bean:bean class="org.springframework.context.support.SimpleThreadScope" />
+				</bean:entry>
+			</bean:map>
+		</bean:property>
+	</bean:bean>
+
+	<bean:bean id="flatFileItemReader" scope="step"
+		class="c.z.spring.batch.remote.partition.c.MyItemReader">
+		<bean:property name="startIndex"
+			value="#{stepExecutionContext[startIndex]}" />
+		<bean:property name="endIndex" value="#{stepExecutionContext[endIndex]}" />
+	</bean:bean>
+
+
+
+	<bean:bean id="jdbcItemWriter"
+		class="c.z.spring.batch.remote.partition.c.MyItemWriter">
+	</bean:bean>
+
+	<bean:bean id="taskExecutor"
+		class="org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor">
+		<bean:property name="corePoolSize" value="5" />
+		<bean:property name="maxPoolSize" value="5" />
+	</bean:bean>
+
+	<!-- <bean:bean id="partitionItemReadListener" class="com.juxtapose.example.ch11.partition.PartitionStepExecutionListener"> 
+		</bean:bean> -->
+</bean:beans>
